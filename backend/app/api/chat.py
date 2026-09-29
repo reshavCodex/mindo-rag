@@ -1,0 +1,166 @@
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from backend.app.rag.retrieval_pipeline import (
+    RAGRetrievalPipeline,
+)
+
+
+# ============================================================
+# CHAT ROUTER
+# ============================================================
+
+router = APIRouter(
+    prefix="/api/v1/chat",
+    tags=["chat"],
+)
+
+
+# ============================================================
+# REQUEST SCHEMA
+# ============================================================
+
+class ChatRetrieveRequest(BaseModel):
+    query: str = Field(
+        ...,
+        min_length=1,
+        description="User's chat question.",
+    )
+
+
+# ============================================================
+# RESPONSE SCHEMA
+# ============================================================
+
+class ChatRetrieveResponse(BaseModel):
+    query: str
+    evidence: list[dict[str, Any]]
+
+
+# ============================================================
+# RETRIEVAL PIPELINE
+# ============================================================
+
+_retrieval_pipeline: RAGRetrievalPipeline | None = None
+
+
+def get_retrieval_pipeline() -> RAGRetrievalPipeline:
+    """
+    Create the retrieval pipeline once and reuse it.
+
+    This prevents BM25, embeddings, Qdrant,
+    and Cohere resources from being recreated
+    for every chat message.
+    """
+
+    global _retrieval_pipeline
+
+    if _retrieval_pipeline is None:
+
+        print()
+        print("=" * 70)
+        print("INITIALIZING MINDO CHAT RAG")
+        print("=" * 70)
+
+        _retrieval_pipeline = RAGRetrievalPipeline(
+            candidate_k=20,
+            final_k=5,
+        )
+
+        print(
+            "MINDO CHAT RAG INITIALIZED"
+        )
+        print("=" * 70)
+
+    return _retrieval_pipeline
+
+
+# ============================================================
+# CHAT RETRIEVAL
+# ============================================================
+
+@router.post(
+    "/retrieve",
+    response_model=ChatRetrieveResponse,
+)
+def retrieve_chat_knowledge(
+    request: ChatRetrieveRequest,
+):
+    """
+    Retrieve knowledge-base evidence for MINDO chat.
+
+    IMPORTANT:
+
+    This endpoint ONLY performs retrieval.
+
+    It does NOT:
+    - generate an assessment
+    - generate a PDF
+    - call the assessment engine
+    - replace the existing report pipeline
+
+    It reuses the existing MINDO RAG retrieval pipeline.
+    """
+
+    try:
+
+        query = request.query.strip()
+
+        if not query:
+
+            raise ValueError(
+                "Chat query cannot be empty."
+            )
+
+        print()
+        print("=" * 70)
+        print("MINDO CHAT RETRIEVAL")
+        print("=" * 70)
+
+        print(
+            f"[QUERY] {query}"
+        )
+
+        pipeline = get_retrieval_pipeline()
+
+        evidence = pipeline.retrieve(
+            query=query
+        )
+
+        print(
+            f"[RAG] Evidence returned: "
+            f"{len(evidence)}"
+        )
+
+        print("=" * 70)
+
+        return {
+            "query": query,
+            "evidence": evidence,
+        }
+
+    except ValueError as error:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        ) from error
+
+    except Exception as error:
+
+        print(
+            "[RAG CHAT ERROR]",
+            repr(error),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Chat retrieval failed: "
+                f"{error}"
+            ),
+        ) from error
