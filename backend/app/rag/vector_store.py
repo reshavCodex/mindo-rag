@@ -1,8 +1,15 @@
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
+
+
+# Load environment variables from .env when running locally.
+# On Render, these values will come from the service environment.
+load_dotenv()
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -15,7 +22,6 @@ DEFAULT_STORAGE_PATH = (
 )
 
 DEFAULT_COLLECTION_NAME = "mindo_knowledge"
-
 DEFAULT_VECTOR_SIZE = 1536
 
 
@@ -23,25 +29,25 @@ class QdrantVectorStore:
     """
     Persistent Qdrant vector store for MINDO RAG.
 
-    Default configuration:
-
-        Embedding model:
-            gemini-embedding-2
-
-        Vector dimension:
-            1536
-
-        Distance:
-            COSINE
-
     Supports:
 
+        - Qdrant Cloud
         - Local persistent Qdrant
-        - Remote Qdrant
         - Vector upsert
         - Similarity search
         - Collection management
         - Clean resource lifecycle
+
+    Connection priority:
+
+        1. QDRANT_URL + QDRANT_API_KEY
+           → Qdrant Cloud / remote Qdrant
+
+        2. Local storage path
+           → Local persistent Qdrant
+
+    This allows Render to use Qdrant Cloud while preserving
+    local Qdrant as a development fallback.
     """
 
     def __init__(
@@ -62,14 +68,40 @@ class QdrantVectorStore:
             )
 
         # --------------------------------------------------
-        # Remote Qdrant
+        # Resolve Qdrant configuration
         # --------------------------------------------------
 
-        if url:
+        # Explicit constructor arguments take priority.
+        # Otherwise use environment variables.
+        qdrant_url = (
+            url
+            if url is not None
+            else os.getenv("QDRANT_URL")
+        )
+
+        qdrant_api_key = (
+            api_key
+            if api_key is not None
+            else os.getenv("QDRANT_API_KEY")
+        )
+
+        # --------------------------------------------------
+        # Remote Qdrant / Qdrant Cloud
+        # --------------------------------------------------
+
+        if qdrant_url:
+
+            print(
+                "[QDRANT] Connecting to remote Qdrant..."
+            )
 
             self.client = QdrantClient(
-                url=url,
-                api_key=api_key,
+                url=qdrant_url,
+                api_key=qdrant_api_key,
+            )
+
+            print(
+                "[QDRANT] Remote Qdrant connection configured."
             )
 
         # --------------------------------------------------
@@ -87,6 +119,10 @@ class QdrantVectorStore:
             path.mkdir(
                 parents=True,
                 exist_ok=True,
+            )
+
+            print(
+                f"[QDRANT] Using local storage: {path}"
             )
 
             self.client = QdrantClient(
@@ -116,12 +152,22 @@ class QdrantVectorStore:
 
         if self.collection_name not in collection_names:
 
+            print(
+                f"[QDRANT] Creating collection: "
+                f"{self.collection_name}"
+            )
+
             self.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=models.VectorParams(
                     size=self.vector_size,
                     distance=models.Distance.COSINE,
                 ),
+            )
+
+            print(
+                f"[QDRANT] Collection created: "
+                f"{self.collection_name}"
             )
 
             return
@@ -134,7 +180,9 @@ class QdrantVectorStore:
             collection_name=self.collection_name
         )
 
-        vectors_config = collection_info.config.params.vectors
+        vectors_config = (
+            collection_info.config.params.vectors
+        )
 
         # Qdrant can represent vectors configuration in
         # different forms depending on the client/version.
@@ -148,12 +196,19 @@ class QdrantVectorStore:
             if existing_size != self.vector_size:
 
                 raise ValueError(
-                    f"Qdrant collection '{self.collection_name}' "
-                    f"uses vector dimension {existing_size}, "
+                    f"Qdrant collection "
+                    f"'{self.collection_name}' "
+                    f"uses vector dimension "
+                    f"{existing_size}, "
                     f"but this application expects "
                     f"{self.vector_size}. "
                     f"The collection must be recreated."
                 )
+
+        print(
+            f"[QDRANT] Collection ready: "
+            f"{self.collection_name}"
+        )
 
     # ------------------------------------------------------
     # Upsert
@@ -188,8 +243,10 @@ class QdrantVectorStore:
             if len(embedding) != self.vector_size:
 
                 raise ValueError(
-                    f"Embedding dimension {len(embedding)} "
-                    f"does not match Qdrant vector size "
+                    f"Embedding dimension "
+                    f"{len(embedding)} "
+                    f"does not match Qdrant "
+                    f"vector size "
                     f"{self.vector_size}."
                 )
 
@@ -218,7 +275,7 @@ class QdrantVectorStore:
             payload = {
                 "text": document.get(
                     "text",
-                    ""
+                    "",
                 ),
                 **metadata,
             }
@@ -394,6 +451,10 @@ class QdrantVectorStore:
 
             pass
 
+
+# ----------------------------------------------------------
+# Direct test
+# ----------------------------------------------------------
 
 if __name__ == "__main__":
 
