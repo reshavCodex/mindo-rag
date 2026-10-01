@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
-from functools import lru_cache
 from typing import Any
 
 from backend.app.rag.query_builder import RAGQueryBuilder
@@ -29,9 +29,25 @@ class MINDORAG:
               ↓
         Assessment Engine
 
-    The object is designed to be created once and reused
-    across multiple assessment requests.
+    The object is designed to be created ONCE per process and
+    shared by every concurrent assessment request.
+
+    Concurrency model
+    -----------------
+    - run() keeps ALL request data (context, query, evidence,
+      analysis, assessment) in local variables. Nothing about a
+      request is ever stored on the shared object, so concurrent
+      calls cannot see each other's data.
+    - The components built in __init__ (BM25 index, Qdrant client,
+      Gemini / Cohere clients) are only READ while serving requests.
+    - close() is idempotent and safe to call while requests are
+      running: it stops accepting new runs, waits for in-flight runs
+      to finish, and only then releases resources.
     """
+
+    # Maximum time close() waits for in-flight runs to finish
+    # before releasing resources anyway.
+    CLOSE_DRAIN_TIMEOUT_SECONDS = 60.0
 
     def __init__(self) -> None:
         print("Initializing MINDO RAG pipeline...")
@@ -41,6 +57,11 @@ class MINDORAG:
         self.final_llm = FinalLLM()
         self.assessment_engine = AssessmentEngine()
 
+        # Lifecycle state only (never request data).
+        self._state = threading.Condition()
+        self._active_runs = 0
+        self._closed = False
+
         print("MINDO RAG pipeline initialized.")
 
     def run(
@@ -49,6 +70,8 @@ class MINDORAG:
     ) -> dict[str, Any]:
         """
         Run the complete MINDO assessment pipeline.
+
+        Safe to call concurrently from multiple threads.
         """
 
         if not context:
@@ -56,86 +79,173 @@ class MINDORAG:
                 "Context cannot be empty."
             )
 
-        # --------------------------------------------
-        # 1. Build retrieval query
-        # --------------------------------------------
+        # Register this run so close() cannot release resources
+        # underneath it.
+        with self._state:
+            if self._closed:
+                raise RuntimeError(
+                    "MINDO RAG pipeline is closed."
+                )
 
-        query = self.query_builder.build_query(
-            context
-        )
+            self._active_runs += 1
 
-        # --------------------------------------------
-        # 2. Retrieve and rerank evidence
-        # --------------------------------------------
+        try:
 
-        evidence = self.retrieval_pipeline.retrieve(
-            query=query
-        )
+            # --------------------------------------------
+            # 1. Build retrieval query
+            # --------------------------------------------
 
-        # --------------------------------------------
-        # 3. Final LLM evidence synthesis
-        # --------------------------------------------
+            query = self.query_builder.build_query(
+                context
+            )
 
-        analysis = self.final_llm.analyze(
-            context=context,
-            evidence=evidence,
-        )
+            # --------------------------------------------
+            # 2. Retrieve and rerank evidence
+            # --------------------------------------------
 
-        # --------------------------------------------
-        # 4. Assessment Engine
-        # --------------------------------------------
+            evidence = self.retrieval_pipeline.retrieve(
+                query=query
+            )
 
-        assessment = self.assessment_engine.assess(
-            analysis=analysis,
-            context=context,
-        )
+            # --------------------------------------------
+            # 3. Final LLM evidence synthesis
+            # --------------------------------------------
 
-        # --------------------------------------------
-        # 5. Return complete pipeline result
-        # --------------------------------------------
+            analysis = self.final_llm.analyze(
+                context=context,
+                evidence=evidence,
+            )
 
-        return {
-            "query": query,
-            "evidence": evidence,
-            "analysis": analysis,
-            "assessment": assessment,
-        }
+            # --------------------------------------------
+            # 4. Assessment Engine
+            # --------------------------------------------
+
+            assessment = self.assessment_engine.assess(
+                analysis=analysis,
+                context=context,
+            )
+
+            # --------------------------------------------
+            # 5. Return complete pipeline result
+            # --------------------------------------------
+
+            return {
+                "query": query,
+                "evidence": evidence,
+                "analysis": analysis,
+                "assessment": assessment,
+            }
+
+        finally:
+
+            with self._state:
+                self._active_runs -= 1
+                self._state.notify_all()
 
     def close(self) -> None:
         """
         Release resources held by the retrieval pipeline.
+
+        Idempotent: calling close() more than once is harmless.
+        New runs are rejected immediately; in-flight runs are
+        allowed to finish (up to CLOSE_DRAIN_TIMEOUT_SECONDS)
+        before resources are released.
         """
+
+        with self._state:
+
+            if self._closed:
+                return
+
+            self._closed = True
+
+            drained = self._state.wait_for(
+                lambda: self._active_runs == 0,
+                timeout=self.CLOSE_DRAIN_TIMEOUT_SECONDS,
+            )
+
+            if not drained:
+                print(
+                    "MINDO RAG close(): timed out waiting for "
+                    f"{self._active_runs} in-flight run(s); "
+                    "releasing resources anyway."
+                )
 
         self.retrieval_pipeline.close()
 
 
-@lru_cache(maxsize=1)
+# ------------------------------------------------------------
+# Shared (process-wide) instance
+#
+# Built exactly once, even if many threads ask for it at the
+# same time. Threads that arrive while the first build is in
+# progress wait on the lock and then receive the same instance.
+# ------------------------------------------------------------
+
+_shared_rag: MINDORAG | None = None
+_shared_rag_lock = threading.Lock()
+
+
 def get_mindo_rag() -> MINDORAG:
     """
-    Return the shared MINDO RAG instance.
+    Return the shared MINDO RAG instance, building it on first use.
 
     The singleton prevents expensive components such as the
-    BM25 index and Qdrant connection from being rebuilt for
-    every request.
+    knowledge-base load, the BM25 index and the Qdrant connection
+    from being rebuilt for every request.
+
+    Thread-safe: concurrent first calls build the pipeline once.
+    If the build fails, nothing is cached and the next call retries.
     """
 
-    return MINDORAG()
+    global _shared_rag
+
+    # Fast path (no lock) once the pipeline is built.
+    rag = _shared_rag
+
+    if rag is not None:
+        return rag
+
+    with _shared_rag_lock:
+
+        # Another thread may have finished building while this
+        # thread was waiting for the lock.
+        if _shared_rag is None:
+            _shared_rag = MINDORAG()
+
+        return _shared_rag
+
+
+def is_mindo_rag_ready() -> bool:
+    """
+    Return True once the shared MINDO RAG instance has been built.
+
+    Never triggers a build, so it is safe for health/readiness checks.
+    """
+
+    return _shared_rag is not None
 
 
 def close_mindo_rag() -> None:
     """
-    Close the shared MINDO RAG instance and clear its cache.
+    Close the shared MINDO RAG instance and clear it.
+
+    Intended to be called ONCE at application shutdown.
+    Idempotent: does nothing if no instance exists.
     """
 
-    if get_mindo_rag.cache_info().currsize == 0:
+    global _shared_rag
+
+    with _shared_rag_lock:
+        rag = _shared_rag
+        _shared_rag = None
+
+    if rag is None:
         return
 
-    rag = get_mindo_rag()
-
-    try:
-        rag.close()
-    finally:
-        get_mindo_rag.cache_clear()
+    # Outside the lock: close() may wait for in-flight runs and
+    # must not block other threads from calling get_mindo_rag().
+    rag.close()
 
 
 def run_mindo_rag(

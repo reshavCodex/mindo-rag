@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from backend.app.rag.mindo_rag import get_mindo_rag
 from backend.app.rag.retrieval_pipeline import (
     RAGRetrievalPipeline,
 )
@@ -45,38 +46,29 @@ class ChatRetrieveResponse(BaseModel):
 # RETRIEVAL PIPELINE
 # ============================================================
 
-_retrieval_pipeline: RAGRetrievalPipeline | None = None
-
-
 def get_retrieval_pipeline() -> RAGRetrievalPipeline:
     """
-    Create the retrieval pipeline once and reuse it.
+    Return the retrieval pipeline owned by the shared
+    MINDO RAG instance.
 
-    This prevents BM25, embeddings, Qdrant,
-    and Cohere resources from being recreated
-    for every chat message.
+    The shared instance is built ONCE when the service starts
+    (see main.py lifespan) and is used by both the report
+    endpoint and this chat endpoint. Chat therefore no longer
+    builds its own second copy of the knowledge base, BM25
+    index, Qdrant client and Cohere client.
+
+    The shared pipeline uses the same retrieval settings this
+    module previously created (candidate_k=20, final_k=5).
+
+    This module must NEVER close the pipeline: its lifecycle
+    belongs to the application, and other requests are using
+    it at the same time.
+
+    If the shared pipeline is still warming up, the call waits
+    for that same build; it never starts a second one.
     """
 
-    global _retrieval_pipeline
-
-    if _retrieval_pipeline is None:
-
-        print()
-        print("=" * 70)
-        print("INITIALIZING MINDO CHAT RAG")
-        print("=" * 70)
-
-        _retrieval_pipeline = RAGRetrievalPipeline(
-            candidate_k=20,
-            final_k=5,
-        )
-
-        print(
-            "MINDO CHAT RAG INITIALIZED"
-        )
-        print("=" * 70)
-
-    return _retrieval_pipeline
+    return get_mindo_rag().retrieval_pipeline
 
 
 # ============================================================

@@ -17,7 +17,10 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-from backend.app.rag.mindo_rag import MINDORAG
+from backend.app.rag.mindo_rag import (
+    close_mindo_rag,
+    get_mindo_rag,
+)
 
 
 class PDFReportGenerator:
@@ -675,121 +678,119 @@ class PDFReportGenerator:
                 "Context cannot be empty."
             )
 
-        rag = None
+        # --------------------------------------------
+        # Run MINDO RAG
+        #
+        # The RAG pipeline is built ONCE per process
+        # (at application startup) and shared by every
+        # request. It must NEVER be closed here: other
+        # users' requests may be using it at the same time.
+        # Its lifecycle is owned by the application
+        # (see main.py lifespan).
+        # --------------------------------------------
 
-        try:
+        rag = get_mindo_rag()
 
-            # --------------------------------------------
-            # Run MINDO RAG
-            # --------------------------------------------
+        pipeline_result = rag.run(
+            context
+        )
 
-            rag = MINDORAG()
-
-            pipeline_result = rag.run(
-                context
+        if not pipeline_result:
+            raise RuntimeError(
+                "MINDO RAG returned an empty result."
             )
 
-            if not pipeline_result:
-                raise RuntimeError(
-                    "MINDO RAG returned an empty result."
-                )
+        # --------------------------------------------
+        # IMPORTANT:
+        #
+        # MINDORAG returns:
+        #
+        # {
+        #     "query": ...,
+        #     "evidence": ...,
+        #     "analysis": ...,
+        #     "assessment": {...}
+        # }
+        #
+        # The PDF must receive the nested
+        # Assessment Engine result.
+        # --------------------------------------------
 
-            # --------------------------------------------
-            # IMPORTANT:
-            #
-            # MINDORAG returns:
-            #
-            # {
-            #     "query": ...,
-            #     "evidence": ...,
-            #     "analysis": ...,
-            #     "assessment": {...}
-            # }
-            #
-            # The PDF must receive the nested
-            # Assessment Engine result.
-            # --------------------------------------------
+        assessment_result = pipeline_result.get(
+            "assessment"
+        )
 
-            assessment_result = pipeline_result.get(
-                "assessment"
+        if not isinstance(
+            assessment_result,
+            dict,
+        ):
+            raise RuntimeError(
+                "MINDO RAG returned an invalid "
+                "Assessment Engine result."
             )
 
-            if not isinstance(
-                assessment_result,
-                dict,
-            ):
-                raise RuntimeError(
-                    "MINDO RAG returned an invalid "
-                    "Assessment Engine result."
-                )
+        # --------------------------------------------
+        # Add Context Builder session information
+        # --------------------------------------------
 
-            # --------------------------------------------
-            # Add Context Builder session information
-            # --------------------------------------------
+        session = context.get(
+            "session",
+            {},
+        )
 
-            session = context.get(
-                "session",
-                {},
-            )
+        if isinstance(
+            session,
+            dict,
+        ):
+
+            assessment_result = {
+                **assessment_result,
+                "session": session,
+            }
+
+        # --------------------------------------------
+        # Generate filename
+        # --------------------------------------------
+
+        if not filename:
+
+            session_id = None
 
             if isinstance(
                 session,
                 dict,
             ):
 
-                assessment_result = {
-                    **assessment_result,
-                    "session": session,
-                }
+                session_id = session.get(
+                    "session_id"
+                )
 
-            # --------------------------------------------
-            # Generate filename
-            # --------------------------------------------
+            if session_id:
 
-            if not filename:
+                filename = (
+                    "mindo_assessment_"
+                    f"{session_id}.pdf"
+                )
 
-                session_id = None
+            else:
 
-                if isinstance(
-                    session,
-                    dict,
-                ):
+                filename = (
+                    "mindo_assessment_report.pdf"
+                )
 
-                    session_id = session.get(
-                        "session_id"
-                    )
+        # --------------------------------------------
+        # Generate PDF
+        # --------------------------------------------
 
-                if session_id:
+        output_path = self.generate(
+            assessment_result=assessment_result,
+            filename=filename,
+        )
 
-                    filename = (
-                        "mindo_assessment_"
-                        f"{session_id}.pdf"
-                    )
-
-                else:
-
-                    filename = (
-                        "mindo_assessment_report.pdf"
-                    )
-
-            # --------------------------------------------
-            # Generate PDF
-            # --------------------------------------------
-
-            output_path = self.generate(
-                assessment_result=assessment_result,
-                filename=filename,
-            )
-
-            return (
-                output_path,
-                assessment_result,
-            )
-
-        finally:
-
-            if rag is not None:
-                rag.close()
+        return (
+            output_path,
+            assessment_result,
+        )
 
 
 def _build_test_assessment() -> dict[str, Any]:
@@ -1318,8 +1319,16 @@ def _run_full_integration_test() -> None:
 
 if __name__ == "__main__":
 
-    # Fast PDF-only test
-    _run_pdf_only_test()
+    try:
 
-    # Real Context Builder → RAG → Assessment → PDF test
-    _run_full_integration_test()
+        # Fast PDF-only test
+        _run_pdf_only_test()
+
+        # Real Context Builder → RAG → Assessment → PDF test
+        _run_full_integration_test()
+
+    finally:
+
+        # The RAG pipeline is shared and no longer closed per
+        # request, so close it once when this local test ends.
+        close_mindo_rag()
